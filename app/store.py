@@ -26,6 +26,16 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT
 );
 
+-- 零报日质检的派生结果：与 events 在同一个写事务里维护
+-- prior_counts 为 JSON 数组：[{"date":"YYYY-MM-DD","count":N}, ...]（前七日，按时间升序）
+CREATE TABLE IF NOT EXISTS zero_report_alerts (
+    alert_date   TEXT PRIMARY KEY,      -- 零报日（UTC）
+    day_count    INTEGER NOT NULL,      -- 该日震例数，恒为 0
+    prior_counts TEXT NOT NULL,         -- 前七日计数 JSON
+    first_seen   TEXT NOT NULL,         -- 首次告警时间（重送不回退）
+    updated_at   TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS event_log (
     id  INTEGER PRIMARY KEY AUTOINCREMENT,
     ts  TEXT NOT NULL,

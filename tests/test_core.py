@@ -79,9 +79,9 @@ class StoreTestBase(unittest.TestCase):
 
     def apply(self, payload, lsn):
         with self.store.write_txn() as cur:
-            counts = apply_transaction(cur, payload)
+            counts, affected_days = apply_transaction(cur, payload)
             Store.set_meta(cur, "last_applied_lsn", lsn)
-            return counts
+            return counts, affected_days
 
     def rows(self):
         return self.store.read(
@@ -133,7 +133,10 @@ class ApplyTest(StoreTestBase):
 
     def test_truncate_ignored(self):
         self.apply({"change": [change("insert", "A")]}, "0/10")
-        counts = self.apply({"change": [{"kind": "truncate", "schema": "public", "table": "seismic_events"}]}, "0/20")
+        counts, _days = self.apply(
+            {"change": [{"kind": "truncate", "schema": "public", "table": "seismic_events"}]},
+            "0/20",
+        )
         self.assertEqual(counts["other"], 1)
         self.assertEqual(len(self.rows()), 1)
 

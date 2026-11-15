@@ -18,6 +18,11 @@ services:
       - max_replication_slots=6
       - -c
       - wal_keep_size=256MB
+      # 新版 PostgreSQL 默认只允许 pgoutput/test_decoding 作为输出插件；
+      # wal2json 必须显式白名单（逗号后不要加空格），否则建槽时报
+      # “library "wal2json" may not be used as an output plugin”
+      - -c
+      - output_plugin_libraries=pgoutput,wal2json
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d quakes"]
       interval: 2s
@@ -43,6 +48,7 @@ services:
       MIRROR_DB: /data/mirror.db
       LOAD_BATCH: "500"              # 初始装载每批行数
       LOAD_SLEEP_MS: "120"           # 每批之间的停顿，放大“装载中修订”的演示窗口；生产可设 0
+      ALERT_TICK_SECONDS: "1"        # 零报日质检的跨日刷新检查间隔（跨过 UTC 午夜后更新）
     depends_on:
       db:
         condition: service_healthy

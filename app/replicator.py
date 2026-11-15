@@ -28,6 +28,7 @@ from canonical import norm_ts
 from changes import apply_transaction
 from lsnutil import int_to_lsn, lsn_to_int
 from store import Store, utcnow
+import zeroreport
 
 WAL2JSON_OPTIONS = {
     "format-version": "1",   # 一条消息 = 一笔源事务
@@ -58,6 +59,9 @@ class Replicator(threading.Thread):
         self.load_sleep_ms = load_sleep_ms
         self.cmds = queue.Queue()
         self.crash_armed = threading.Event()   # 演示：保存后未确认就崩溃
+        self._rep_conn = None                  # 当前逻辑复制连接（用于唤醒重建）
+        self._rep_lock = threading.Lock()
+        self._wake_for_rebuild = threading.Event()
 
     # ---------------- 外部指令 ----------------
     def request_start(self):
@@ -65,6 +69,16 @@ class Replicator(threading.Thread):
 
     def request_rebuild(self):
         self.cmds.put("rebuild")
+        # 源库可能长时间没有事务：仅靠队列要等到下一条消息才会被处理。
+        # 主动取消当前复制流，让线程立刻回到主循环按 load_state=loading 重建。
+        self._wake_for_rebuild.set()
+        with self._rep_lock:
+            conn = self._rep_conn
+        if conn is not None:
+            try:
+                conn.cancel()
+            except Exception:
+                pass
 
     def arm_crash_after_save(self):
         self.crash_armed.set()
@@ -82,6 +96,7 @@ class Replicator(threading.Thread):
                             self.store.log("收到开始指令，准备初始装载", cur)
                 elif state in ("loading", "catchup"):
                     # 含「重启后发现未建完 -> 重做」路径
+                    self._wake_for_rebuild.clear()
                     self._reset_for_build()
                     self._build_and_stream()
                 elif state == "done":
@@ -95,6 +110,10 @@ class Replicator(threading.Thread):
                     Store.set_meta(cur, "load_state", "loading")
                     self.store.log("收到重建指令：丢弃当前进度，重新建立镜像", cur)
             except Exception as exc:             # 连接中断等：按持久化状态恢复
+                if self._wake_for_rebuild.is_set():
+                    # 是 request_rebuild 主动取消复制流造成的异常：直接重建，不空等
+                    self.store.log("重建指令已唤醒复制流：立即丢弃旧镜像重新建立")
+                    continue
                 self.store.log(f"复制中断：{exc!r}；5 秒后按当前状态恢复")
                 traceback.print_exc()
                 time.sleep(5)
@@ -103,6 +122,7 @@ class Replicator(threading.Thread):
     def _reset_for_build(self):
         with self.store.write_txn() as cur:
             cur.execute("DELETE FROM events")
+            zeroreport.reset_alerts(cur)      # 重建期间不供旧结果
             for key, value in (
                 ("load_state", "loading"),
                 ("loaded_rows", "0"),
@@ -118,6 +138,8 @@ class Replicator(threading.Thread):
 
     def _build_and_stream(self):
         rep_conn = psycopg2.connect(connection_factory=LogicalReplicationConnection, **self.pg)
+        with self._rep_lock:
+            self._rep_conn = rep_conn
         try:
             rep_cur = rep_conn.cursor()
             self._drop_slot_if_exists()
@@ -134,17 +156,33 @@ class Replicator(threading.Thread):
             t0 = time.monotonic()
             loaded = self._initial_load(snapshot_name)
             target = self._current_wal_flush_lsn()
+            consistent_lsn = lsn_to_int(consistent_point)
             with self.store.write_txn() as cur:
                 Store.set_meta(cur, "load_state", "catchup")
                 Store.set_meta(cur, "target_lsn", int_to_lsn(target))
+                # 快照位置就是已知应用到的位置：源库随后没有新事务时
+                # 也能凭 keepalive 完成追平判定（否则会永远停在 catchup）
+                Store.set_meta(cur, "last_applied_lsn", consistent_point)
+                n_alerts = zeroreport.full_rebuild(cur)
+                immediate = consistent_lsn >= target
+                if immediate:
+                    Store.set_meta(cur, "load_state", "done")
+                    Store.set_meta(cur, "ready_at", utcnow())
                 self.store.log(
                     f"初始装载完成：{loaded} 行，耗时 {time.monotonic() - t0:.1f}s；"
-                    f"开始追平后续变更（目标 {int_to_lsn(target)}）",
+                    f"零报日质检已按目录重建（{n_alerts} 条告警）；"
+                    + (
+                        f"槽位一致点即 WAL 末尾（{consistent_point}），无需追平，镜像就绪，开始供数"
+                        if immediate else
+                        f"开始追平后续变更（目标 {int_to_lsn(target)}）"
+                    ),
                     cur,
                 )
             # 从 consistent_point 起流式接收：装载期间的源库修改全部在这里补齐
-            self._consume(rep_cur, slot_name, lsn_to_int(consistent_point), target)
+            self._consume(rep_cur, slot_name, consistent_lsn, target)
         finally:
+            with self._rep_lock:
+                self._rep_conn = None
             try:
                 rep_conn.close()
             except Exception:
@@ -197,11 +235,15 @@ class Replicator(threading.Thread):
                 self.store.log("复制槽不存在（源库可能已重置），无法续采，转为重新建立镜像", cur)
             return
         rep_conn = psycopg2.connect(connection_factory=LogicalReplicationConnection, **self.pg)
+        with self._rep_lock:
+            self._rep_conn = rep_conn
         try:
             rep_cur = rep_conn.cursor()
             self.store.log(f"镜像已就绪，从复制槽 {self.slot} 的已确认位置续采")
             self._consume(rep_cur, self.slot, 0, None)
         finally:
+            with self._rep_lock:
+                self._rep_conn = None
             try:
                 rep_conn.close()
             except Exception:
@@ -223,8 +265,12 @@ class Replicator(threading.Thread):
             payload = json.loads(msg.payload)
             lsn = msg.data_start
             with self.store.write_txn() as cur:
-                counts = apply_transaction(cur, payload)
+                counts, affected_days = apply_transaction(cur, payload)
                 n_changes = counts["insert"] + counts["update"] + counts["delete"]
+                # 零报日质检：同一事务内按整笔源事务完成后的目录重判受影响日及其后七日。
+                # 迟报、跨日更正、删除都会走到这里；失败则数据 + 告警 + 位置一起回滚，
+                # 不向源库确认，源库重送时重算（告警幂等，first_seen 不回退）。
+                zeroreport.evaluate_affected_days(cur, affected_days)
                 _bump(cur, "applied_txns", 1)
                 if n_changes:
                     _bump(cur, "applied_changes", n_changes)

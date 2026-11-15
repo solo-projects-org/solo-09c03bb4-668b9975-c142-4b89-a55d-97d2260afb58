@@ -18,6 +18,7 @@ from canonical import canonical_line, norm_ts
 from lsnutil import lsn_to_int
 from replicator import Replicator
 from store import Store
+import zeroreport
 
 PG = dict(
     host=os.environ.get("PGHOST", "db"),
@@ -33,12 +34,18 @@ LOAD_SLEEP_MS = int(os.environ.get("LOAD_SLEEP_MS", "120"))
 
 store = Store(MIRROR_DB)
 replicator = Replicator(PG, SLOT, store, load_batch=LOAD_BATCH, load_sleep_ms=LOAD_SLEEP_MS)
+ALERT_TICK_SECONDS = float(os.environ.get("ALERT_TICK_SECONDS", "1"))
+alerts_refresher = zeroreport.MidnightRefresher(store, interval=ALERT_TICK_SECONDS)
 
 
 @asynccontextmanager
 async def lifespan(_app):
     replicator.start()
-    yield
+    alerts_refresher.start()
+    try:
+        yield
+    finally:
+        alerts_refresher.stop()
 
 
 app = FastAPI(title="震例目录镜像采集", lifespan=lifespan)
@@ -127,6 +134,9 @@ def collect_status():
         "target_lsn": meta.get("target_lsn") or "",
         "ready_at": meta.get("ready_at") or "",
         "mirror_rows": store.read("SELECT count(*) FROM events")[0][0],
+        "alerts_ready": meta.get("alerts_ready") == "1",
+        "alerts_evaluated_through": meta.get("alerts_evaluated_through") or "",
+        "alerts_count": None,
         "crash_armed": replicator.crash_armed.is_set(),
         "source_ok": False,
         "source_rows": None,
@@ -164,6 +174,12 @@ def collect_status():
         and state == "done"
         and lsn_to_int(st["last_applied_lsn"]) > lsn_to_int(st["slot"]["confirmed_flush_lsn"])
     )
+    if st["serving"] and st["alerts_ready"]:
+        txn = store.read_txn()
+        try:
+            st["alerts_count"] = zeroreport.alert_count(txn)
+        finally:
+            txn.close()
     st["log"] = store.recent_log(15)
     return st
 
@@ -202,6 +218,14 @@ def dashboard():
         rows.append(("槽位一致点 consistent_point", f"<span class='mono'>{esc(st['consistent_point'])}</span>"))
     if st["target_lsn"]:
         rows.append(("追平目标 target_lsn", f"<span class='mono'>{esc(st['target_lsn'])}</span>"))
+    if st["alerts_ready"]:
+        rows.append((
+            "零报日质检",
+            f"{st['alerts_count']} 条告警 · 已评估截至 {esc(st['alerts_evaluated_through'])}"
+            "（跨 UTC 午夜自动更新）",
+        ))
+    else:
+        rows.append(("零报日质检", "重建中/尚未就绪，不供旧结果"))
     if st["ready_at"]:
         rows.append(("就绪时间", esc(st["ready_at"])))
 
@@ -241,10 +265,11 @@ def dashboard():
                 "<button type='submit' class='danger'>模拟崩溃：保存后未确认</button></form>"
             )
         actions.append("<a class='btn' href='/events'>查询震例</a>")
+        actions.append("<a class='btn' href='/alerts'>零报日质检</a>")
         actions.append("<a class='btn' href='/events.csv'>下载当前目录 CSV</a>")
         actions.append("<a class='btn' href='/verify'>一致性校验</a>")
     else:
-        actions.append("<span class='muted'>镜像就绪后开放查询、CSV 下载与一致性校验</span>")
+        actions.append("<span class='muted'>镜像就绪后开放查询、CSV 下载、零报日质检与一致性校验</span>")
 
     log_rows = "".join(
         f"<tr><td>{esc(ts)}</td><td>{esc(msg)}</td></tr>" for ts, msg in st["log"]
@@ -276,6 +301,12 @@ def mirror_start():
 
 @app.post("/mirror/rebuild")
 def mirror_rebuild():
+    # 立刻停止供数（查询/CSV/零报日一律 503），而不是等复制线程排到这条指令：
+    # 重建期间不得把上一代目录的结果拿出去。
+    with store.write_txn() as cur:
+        Store.set_meta(cur, "load_state", "loading")
+        zeroreport.reset_alerts(cur)
+        store.log("收到重建指令：立即停止供数，丢弃旧镜像与旧告警，重新建立", cur)
     replicator.request_rebuild()
     return RedirectResponse("/", status_code=303)
 
@@ -432,6 +463,162 @@ def events_csv(request: Request):
         gen(),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=quake_catalog.csv"},
+    )
+
+
+# ---------------- 路由：零报日质检 ----------------
+
+ALERT_PAGE_SIZE = 50
+
+
+def _prior_days_html(prior_counts):
+    cells = "".join(
+        f"<td class='mono'>{esc(item['count'])}</td>" for item in prior_counts
+    )
+    return cells
+
+
+def _alerts_view(request: Request):
+    """解析分页与告警日筛选；格式错误返回 None。"""
+    qp = request.query_params
+    try:
+        page_no = max(1, int(qp.get("page", "1")))
+        day = (qp.get("day") or "").strip()
+        if day:
+            day = zeroreport.as_date(day).isoformat()
+    except ValueError:
+        return None
+    return page_no, day or None
+
+
+def _alerts_not_ready():
+    body = (
+        "<div class='card'><h2>零报日质检暂不可用</h2>"
+        "<p class='muted'>镜像尚未就绪，或零报日结果正在按重建后的目录重算 —— "
+        "重建期间不提供上一代目录的旧结果。</p>"
+        "<p><a class='btn' href='/'>返回采集状态</a></p></div>"
+    )
+    return HTMLResponse(page("零报日质检暂不可用", body), status_code=503)
+
+
+@app.get("/alerts", response_class=HTMLResponse)
+def alerts(request: Request):
+    parsed = _alerts_view(request)
+    if parsed is None:
+        return HTMLResponse(
+            page("参数错误", "<div class='card'><p>日期参数格式应为 YYYY-MM-DD。</p>"
+                 "<p><a class='btn' href='/alerts'>返回零报日质检</a></p></div>"),
+            status_code=400,
+        )
+    page_no, day = parsed
+
+    if not serving() or store.get_meta("alerts_ready", "0") != "1":
+        return _alerts_not_ready()
+
+    # 告警与判定进度在同一个只读事务里读取：展示的是同一已提交状态
+    txn = store.read_txn()
+    try:
+        total = zeroreport.list_alerts(txn, limit=0, day=day)["total"]
+        pages = max(1, (total + ALERT_PAGE_SIZE - 1) // ALERT_PAGE_SIZE)
+        page_no = min(page_no, pages)
+        result = zeroreport.list_alerts(
+            txn, limit=ALERT_PAGE_SIZE, offset=(page_no - 1) * ALERT_PAGE_SIZE, day=day
+        )
+        meta = dict(txn.execute("SELECT key, value FROM meta").fetchall())
+        evaluated_through = meta.get("alerts_evaluated_through") or ""
+        updated_at = meta.get("alerts_updated_at") or ""
+    finally:
+        txn.close()
+
+    head = "".join(
+        f"<th>前{i}日</th>" for i in range(zeroreport.WINDOW_DAYS, 0, -1)
+    )
+    body_rows = "".join(
+        "<tr>"
+        f"<td class='mono'>{esc(item['date'])}</td>"
+        f"<td class='mono'>{esc(item['day_count'])}</td>"
+        f"{_prior_days_html(item['prior_counts'])}"
+        f"<td class='mono'>{esc(item['prior_total'])}</td>"
+        f"<td class='mono'>{esc(item['first_seen'])}</td>"
+        "</tr>"
+        for item in result["items"]
+    ) or "<tr><td colspan='11' class='muted'>没有零报日告警</td></tr>"
+
+    day_input = (
+        f"<label>指定告警日</label><input name='day' value='{esc(day or '')}' "
+        "size='10' placeholder='2026-11-10'>"
+    )
+    qs = {"day": day} if day else {}
+    prev_q = urllib.parse.urlencode({**qs, "page": page_no - 1})
+    next_q = urllib.parse.urlencode({**qs, "page": page_no + 1})
+    pager = []
+    if page_no > 1:
+        pager.append(f"<a class='btn' href='/alerts?{prev_q}'>上一页</a>")
+    pager.append(
+        f"<span class='muted'>第 {page_no} / {pages} 页 · 共 {result['total']} 个零报日"
+        f"（同一已提交状态）</span>"
+    )
+    if page_no < pages:
+        pager.append(f"<a class='btn' href='/alerts?{next_q}'>下一页</a>")
+    pager.append(f"<a class='btn' href='/alerts.csv?{urllib.parse.urlencode(qs)}'>下载告警 CSV</a>")
+    pager.append("<a class='btn' href='/'>返回采集状态</a>")
+
+    body = (
+        "<div class='card'><h2>零报日质检</h2>"
+        "<p class='muted'>规则：某个已结束的 UTC 日没有震例，且此前连续 7 天每天至少 "
+        f"{zeroreport.MIN_EVENTS_PER_DAY} 笔时告警。当天尚未结束，不参与判定。"
+        "迟报、跨日更正与删除会按整笔源事务完成后的目录重判受影响日及其后七日；"
+        "即使源库没有新事务，跨过 UTC 午夜后也会更新。"
+        f"当前判定截至 <b>{esc(evaluated_through)}</b>"
+        f"（更新时间 {esc(updated_at)}）。</p>"
+        f"<form method='get' action='/alerts'>{day_input}"
+        "<button type='submit'>查看</button>"
+        "<a class='btn' href='/alerts'>清除筛选</a></form></div>"
+        "<div class='card'><h2>告警日与前七日计数</h2>"
+        f"<table><tr><th>零报日（UTC）</th><th>当日</th>{head}<th>前七合计</th>"
+        f"<th>首次告警</th></tr>{body_rows}</table>"
+        f"<p style='margin-top:12px'>{''.join(pager)}</p></div>"
+    )
+    return page("零报日质检", body)
+
+
+@app.get("/alerts.csv")
+def alerts_csv(request: Request):
+    parsed = _alerts_view(request)
+    if parsed is None:
+        return Response("日期参数格式不正确\n", status_code=400, media_type="text/plain; charset=utf-8")
+    _page_no, day = parsed
+    if not serving() or store.get_meta("alerts_ready", "0") != "1":
+        return Response("零报日质检暂不可用\n", status_code=503, media_type="text/plain; charset=utf-8")
+
+    def gen():
+        header = ["alert_date_utc", "day_count"] + [
+            f"day_{i}_count" for i in range(zeroreport.WINDOW_DAYS, 0, -1)
+        ] + [f"day_{i}_date_utc" for i in range(zeroreport.WINDOW_DAYS, 0, -1)] + [
+            "prior_7_total", "first_seen", "updated_at",
+        ]
+        yield ",".join(header) + "\n"
+        txn = store.read_txn()          # 整个 CSV 出自同一已提交状态
+        try:
+            total = zeroreport.list_alerts(txn, limit=0, day=day)["total"]
+            batches = max(1, (total + 1999) // 2000)
+            for b in range(batches):
+                for item in zeroreport.list_alerts(
+                    txn, limit=2000, offset=b * 2000, day=day
+                )["items"]:
+                    counts = [str(x["count"]) for x in item["prior_counts"]]
+                    dates = [x["date"] for x in item["prior_counts"]]
+                    line = [item["date"], str(item["day_count"])] + counts + dates + [
+                        str(item["prior_total"]), item["first_seen"], item["updated_at"],
+                    ]
+                    yield ",".join(line) + "\n"
+        finally:
+            txn.close()
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=zero_report_days.csv"},
     )
 
 
